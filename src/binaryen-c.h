@@ -3573,6 +3573,23 @@ BINARYEN_API void BinaryenModuleSetFieldName(BinaryenModuleRef module,
                                              const char* name);
 
 //
+// ========= WasmVisitor =========
+//
+
+#ifdef __cplusplus
+namespace wasm {
+struct WasmVisitor;
+} // namespace wasm
+typedef struct wasm::WasmVisitor* WasmVisitorRef;
+#else
+typedef struct WasmVisitor* WasmVisitorRef;
+#endif
+
+// Constructs a new Wasm visitor that allows for the
+// visiting and transforming of Wasm modules.
+BINARYEN_API WasmVisitorRef WasmVisitorCreate();
+
+//
 // ========= Utilities =========
 //
 

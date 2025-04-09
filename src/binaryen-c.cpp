@@ -6292,6 +6292,14 @@ void BinaryenModuleSetFieldName(BinaryenModuleRef module,
 }
 
 //
+// ========= WasmVisitor =========
+//
+
+BINARYEN_API WasmVisitorRef WasmVisitorCreate() {
+  
+}
+
+//
 // ========= Utilities =========
 //
 
