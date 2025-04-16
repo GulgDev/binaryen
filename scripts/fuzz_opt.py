@@ -152,11 +152,13 @@ def randomize_feature_opts():
         # The shared-everything feature is new and we want to fuzz it, but it
         # also currently disables fuzzing V8, so disable it most of the time.
         # Same with custom descriptors and strings - all these cannot be run in
-        # V8 for now.
+        # V8 for now. Relaxed SIMD's nondeterminism disables much but not all of
+        # our V8 fuzzing, so avoid it too.
         if random.random() < 0.9:
             FEATURE_OPTS.append('--disable-shared-everything')
             FEATURE_OPTS.append('--disable-custom-descriptors')
             FEATURE_OPTS.append('--disable-strings')
+            FEATURE_OPTS.append('--disable-relaxed-simd')
 
     print('randomized feature opts:', '\n  ' + '\n  '.join(FEATURE_OPTS))
 
@@ -665,16 +667,28 @@ def run_bynterp(wasm, args):
         del os.environ['BINARYEN_MAX_INTERPRETER_DEPTH']
 
 
-# Enable even more staged things than V8_OPTS. V8_OPTS are the flags we want to
-# use when testing, and enable all features we test against, while --future may
-# also enable non-feature things like new JITs and such (which are never needed
-# for our normal tests, but do make sense to fuzz for V8's sake). We do this
-# randomly for more variety.
+# Enable even more things than V8_OPTS. V8_OPTS are the flags we want to use
+# when testing, on our fixed test suite, but when fuzzing we may want more.
 def get_v8_extra_flags():
-    return ['--future'] if random.random() < 0.5 else []
+    # Due to https://github.com/WebAssembly/exception-handling/issues/344 , VMs
+    # do not allow mixed old and new wasm EH. Our fuzzer will very frequently
+    # mix those instructions in a module, so we must use the flag to allow that.
+    # FIXME This is not great, as the majority of the wasm files we test on are
+    #       not actually valid in VMs. But we get coverage this way for runtime
+    #       linking of old and new EH (which VMs allow), that is, our compile-
+    #       time combination of old and new simulates runtime linking to some
+    #       extent.
+    flags = ['--wasm-allow-mixed-eh-for-testing']
+
+    # Sometimes add --future, which may enable new JITs and such, which is good
+    # to fuzz for V8's sake.
+    if random.random() < 0.5:
+        flags += ['--future']
+
+    return flags
 
 
-V8_LIFTOFF_ARGS = ['--liftoff', '--no-wasm-tier-up']
+V8_LIFTOFF_ARGS = ['--liftoff']
 
 
 # Default to running with liftoff enabled, because we need to pick either
@@ -805,7 +819,7 @@ class CompareVMs(TestCaseHandler):
             def can_compare_to_self(self):
                 return True
 
-            def can_compare_to_others(self):
+            def can_compare_to_other(self, other):
                 return True
 
         class D8:
@@ -826,10 +840,15 @@ class CompareVMs(TestCaseHandler):
                 # can compare to themselves after opts in that case.
                 return not NANS
 
-            def can_compare_to_others(self):
+            def can_compare_to_other(self, other):
+                # Relaxed SIMD allows different behavior between VMs, so only
+                # allow comparisons to other d8 variants if it is enabled.
+                if not all_disallowed(['relaxed-simd']) and not other.name.startswith('d8'):
+                    return False
+
                 # If not legalized, the JS will fail immediately, so no point to
                 # compare to others.
-                return LEGALIZE and not NANS
+                return self.can_compare_to_self() and LEGALIZE
 
         class D8Liftoff(D8):
             name = 'd8_liftoff'
@@ -841,7 +860,10 @@ class CompareVMs(TestCaseHandler):
             name = 'd8_turboshaft'
 
             def run(self, wasm):
-                return super(D8Turboshaft, self).run(wasm, extra_d8_flags=['--no-liftoff', '--turboshaft-wasm', '--turboshaft-wasm-instruction-selection-staged'])
+                flags = ['--no-liftoff']
+                if random.random() < 0.5:
+                    flags += ['--no-wasm-generic-wrapper']
+                return super(D8Turboshaft, self).run(wasm, extra_d8_flags=flags)
 
         class Wasm2C:
             name = 'wasm2c'
@@ -883,7 +905,7 @@ class CompareVMs(TestCaseHandler):
                 # expects, but that's not quite what C has
                 return not NANS
 
-            def can_compare_to_others(self):
+            def can_compare_to_other(self, other):
                 # C won't trap on OOB, and NaNs can differ from wasm VMs
                 return not OOB and not NANS
 
@@ -930,7 +952,7 @@ class CompareVMs(TestCaseHandler):
                 return super(Wasm2C2Wasm, self).can_run(wasm) and self.has_emcc and \
                     os.path.getsize(wasm) <= INPUT_SIZE_MEAN
 
-            def can_compare_to_others(self):
+            def can_compare_to_other(self, other):
                 # NaNs can differ from wasm VMs
                 return not NANS
 
@@ -958,10 +980,12 @@ class CompareVMs(TestCaseHandler):
         ignored_before = ignored_vm_runs
 
         # vm_results will map vms to their results
+        relevant_vms = []
         vm_results = {}
         for vm in self.vms:
             if vm.can_run(wasm):
                 print(f'[CompareVMs] running {vm.name}')
+                relevant_vms.append(vm)
                 vm_results[vm] = fix_output(vm.run(wasm))
 
                 # If the binaryen interpreter hit a host limitation then do not
@@ -982,13 +1006,13 @@ class CompareVMs(TestCaseHandler):
                     return vm_results
 
         # compare between the vms on this specific input
-        first_vm = None
-        for vm in vm_results.keys():
-            if vm.can_compare_to_others():
-                if first_vm is None:
-                    first_vm = vm
-                else:
-                    compare_between_vms(vm_results[first_vm], vm_results[vm], 'CompareVMs between VMs: ' + first_vm.name + ' and ' + vm.name)
+        num_vms = len(relevant_vms)
+        for i in range(0, num_vms):
+            for j in range(i + 1, num_vms):
+                vm1 = relevant_vms[i]
+                vm2 = relevant_vms[j]
+                if vm1.can_compare_to_other(vm2) and vm2.can_compare_to_other(vm1):
+                    compare_between_vms(vm_results[vm1], vm_results[vm2], 'CompareVMs between VMs: ' + vm1.name + ' and ' + vm2.name)
 
         return vm_results
 
@@ -1638,7 +1662,7 @@ class ClusterFuzz(TestCaseHandler):
         # flags here!
         with open(flags_file, 'r') as f:
             flags = f.read()
-        cmd.append(flags)
+        cmd += flags.split(' ')
         # Run the fuzz file, which contains a modified fuzz_shell.js - we do
         # *not* run fuzz_shell.js normally.
         cmd.append(os.path.abspath(fuzz_file))
